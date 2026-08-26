@@ -1,24 +1,27 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ComputerClient } from "./client/computer-client.js";
 import { z } from "zod";
+import { ComputerClient } from "./client/computer-client.js";
 import {
+  actionOperationSchema,
   approveAutonomousSchema,
-  codingCommandCancelSchema,
-  codingCommandSchema,
-  codingCommandStatusSchema,
-  codingEditSchema,
-  codingListSchema,
-  codingReadSchema,
-  codingSearchSchema,
-  codingWriteSchema,
+  approveOperationSchema,
+  cancelOperationSchema,
+  codeBlockOperationSchema,
+  editOperationSchema,
+  inspectListSchema,
+  inspectReadSchema,
   executeTaskSchema,
   messageSchema,
   monitorAutonomousSchema,
   monitorIdSchema,
+  operationEventsSchema,
+  operationIdSchema,
+  sshOperationSchema,
   startTaskSchema,
   steerAutonomousSchema,
   taskIdSchema,
   workspaceIdSchema,
+  writeOperationSchema,
 } from "./schemas/tools.js";
 
 function result<T extends Record<string, unknown>>(value: T) {
@@ -28,29 +31,35 @@ function result<T extends Record<string, unknown>>(value: T) {
   };
 }
 
-const autonomousSummaryOutputSchema = {
-  monitor_id: z.string().optional(),
-  goal_id: z.string().optional(),
-  workspace_id: z.string().optional(),
-  status: z.string().optional(),
-  scope_count: z.number().optional(),
-  verified_count: z.number().optional(),
-  current_scope: z.string().nullable().optional(),
-  original_goal: z.string().optional(),
-  acceptance_criteria: z.array(z.string()).optional(),
-  approval_id: z.string().nullable().optional(),
-  approval: z.record(z.string(), z.unknown()).optional(),
-  scopes: z.array(z.record(z.string(), z.unknown())).optional(),
+const operationOutputSchema = {
+  operation_id: z.string(),
+  workspace_id: z.string(),
+  kind: z.enum(["WRITE_FILE", "EDIT_FILE", "RUN_ACTION", "RUN_CODE_BLOCK", "SSH_EXECUTE"]),
+  state: z.string(),
+  approval_id: z.string().nullable(),
+  result: z.record(z.string(), z.unknown()),
+  error_code: z.string().nullable(),
+  created_at: z.number(),
+  updated_at: z.number(),
+  finished_at: z.number().nullable(),
+  replayed: z.boolean().optional(),
 };
 
+/**
+ * Register only ChatGPT-planned durable workspace tools.
+ *
+ * No tool here accepts a CPTR model ID, starts a CPTR task, invokes the CPTR
+ * OpenAI-compatible gateway, or delegates planning to an autonomous monitor.
+ */
 export function createMcpServer(client: ComputerClient): McpServer {
-  const server = new McpServer({ name: "chatgpt-computer-plugin", version: "0.1.0" });
+  const server = new McpServer({ name: "chatgpt-computer-plugin", version: "0.2.0" });
+  const legacyFallbackEnabled = process.env.CPTR_LEGACY_FALLBACK_ENABLED === "true";
 
   server.registerTool(
     "cptr_list_workspaces",
     {
-      title: "List CPTR workspaces",
-      description: "Use this when the user wants to discover the CPTR workspaces they can control.",
+      title: "List authorized CPTR workspaces",
+      description: "Use this to discover CPTR workspaces available to the user before direct inspection or coding.",
       inputSchema: {},
       outputSchema: { workspaces: z.array(z.record(z.string(), z.unknown())) },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
@@ -61,8 +70,8 @@ export function createMcpServer(client: ComputerClient): McpServer {
   server.registerTool(
     "cptr_get_workspace",
     {
-      title: "Get a CPTR workspace",
-      description: "Use this when the user wants details about one CPTR workspace by workspace ID.",
+      title: "Get an authorized CPTR workspace",
+      description: "Use this to inspect the metadata of a single authorized workspace.",
       inputSchema: workspaceIdSchema,
       outputSchema: { workspace_id: z.string(), name: z.string() },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
@@ -71,328 +80,340 @@ export function createMcpServer(client: ComputerClient): McpServer {
   );
 
   server.registerTool(
-    "cptr_code_list_files",
+    "cptr_inspect_list",
     {
-      title: "List files in an authorized CPTR workspace",
+      title: "List files in an authorized workspace",
       description:
-        "Use this to inspect the selected CPTR workspace before ChatGPT directly edits code. It cannot access paths outside that workspace.",
-      inputSchema: codingListSchema,
-      outputSchema: { workspace_id: z.string(), path: z.string(), entries: z.string() },
+        "Use this to inspect one directory before coding. Results are bounded and cursor-paginated; it cannot access paths outside the selected workspace.",
+      inputSchema: inspectListSchema,
+      outputSchema: {
+        workspace_id: z.string(),
+        path: z.string(),
+        entries: z.array(
+          z.object({
+            name: z.string(),
+            type: z.string(),
+            size: z.number().nullable(),
+            modified: z.string().nullable(),
+          }),
+        ),
+        next_cursor: z.number().nullable(),
+        truncated: z.boolean(),
+      },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
-    async (input) => result(await client.listCodingFiles(input)),
+    async (input) => result(await client.inspectFiles(input)),
   );
 
   server.registerTool(
-    "cptr_code_read_file",
+    "cptr_inspect_read",
     {
-      title: "Read an authorized CPTR workspace file",
+      title: "Read a workspace file with a revision",
       description:
-        "Use this to read source code in the selected CPTR workspace before ChatGPT edits it. Environment files, binary files, paths outside the workspace, and oversized files are rejected by CPTR.",
-      inputSchema: codingReadSchema,
+        "Use this to inspect source code before editing. Record the returned revision and supply it to a later mutation so CPTR can reject stale writes.",
+      inputSchema: inspectReadSchema,
       outputSchema: {
         workspace_id: z.string(),
         path: z.string(),
         content: z.string(),
-        start_line: z.number().int(),
-        end_line: z.number().int(),
-        total_lines: z.number().int(),
-        size: z.number().int(),
+        revision: z.string(),
+        start_line: z.number(),
+        end_line: z.number(),
+        total_lines: z.number(),
+        size: z.number(),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
-    async (input) => result(await client.readCodingFile(input)),
+    async (input) => result(await client.inspectFile(input)),
   );
 
   server.registerTool(
-    "cptr_code_search_files",
+    "cptr_create_file_operation",
     {
-      title: "Search an authorized CPTR workspace",
+      title: "Create a durable versioned file write",
       description:
-        "Use this to locate symbols, text, or files in the selected CPTR workspace before ChatGPT edits code.",
-      inputSchema: codingSearchSchema,
-      outputSchema: { workspace_id: z.string(), path: z.string(), matches: z.string() },
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    },
-    async (input) => result(await client.searchCodingFiles(input)),
-  );
-
-  server.registerTool(
-    "cptr_code_write_file",
-    {
-      title: "Write a file in an authorized CPTR workspace",
-      description:
-        "Use this only when the user explicitly asks ChatGPT to create or replace code in the selected CPTR workspace. Read the existing file first when modifying it. CPTR rejects paths outside the workspace and environment files.",
-      inputSchema: codingWriteSchema,
-      outputSchema: { workspace_id: z.string(), path: z.string(), bytes_written: z.number().int() },
+        "Use only when the user explicitly asks ChatGPT to create or replace a file. Supply the revision returned by cptr_inspect_read, or MISSING for a new file, and reuse the idempotency key only when retrying this exact logical write.",
+      inputSchema: writeOperationSchema,
+      outputSchema: operationOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
-    async (input) => result(await client.writeCodingFile(input)),
+    async (input) => result(await client.createWriteOperation(input)),
   );
 
   server.registerTool(
-    "cptr_code_edit_file",
+    "cptr_create_edit_operation",
     {
-      title: "Apply an exact code edit in an authorized CPTR workspace",
+      title: "Create a durable exact file edit",
       description:
-        "Use this only when the user explicitly asks ChatGPT to modify code. It replaces an exact, unique target string and refuses ambiguous edits, so read the file first and then provide the precise target.",
-      inputSchema: codingEditSchema,
-      outputSchema: {
-        workspace_id: z.string(),
-        path: z.string(),
-        replaced_characters: z.number().int(),
-        inserted_characters: z.number().int(),
-      },
+        "Use only when the user explicitly asks ChatGPT to edit code. Read the file first, send its revision, and supply an exact unique target. CPTR rejects stale or ambiguous mutations.",
+      inputSchema: editOperationSchema,
+      outputSchema: operationOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
-    async (input) => result(await client.editCodingFile(input)),
+    async (input) => result(await client.createEditOperation(input)),
   );
 
   server.registerTool(
-    "cptr_code_run_command",
+    "cptr_run_workspace_action",
     {
-      title: "Run a bounded validation command in an authorized CPTR workspace",
+      title: "Request a durable structured workspace action",
       description:
-        "Use this only when the user explicitly asks ChatGPT to run a development or validation command in the selected CPTR workspace. CPTR rejects destructive commands. Commands that might contact external services require explicit user approval through allow_network=true.",
-      inputSchema: codingCommandSchema,
-      outputSchema: {
-        command_id: z.string(),
-        status: z.string(),
-        exit_code: z.number().int().nullable(),
-        output: z.string(),
-        next_offset: z.number().int(),
-      },
+        "Use only when the user explicitly asks ChatGPT to validate code. This accepts a named action, not an arbitrary command; CPTR may reject it until a deployment-configured isolated executor is available.",
+      inputSchema: actionOperationSchema,
+      outputSchema: operationOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async (input) => result(await client.runWorkspaceAction(input)),
+  );
+
+  server.registerTool(
+    "cptr_run_code_block",
+    {
+      title: "Request a sandboxed workspace code block",
+      description:
+        "Use only when the user explicitly asks ChatGPT to execute the supplied code in the workspace. The operation is durable, requires approval, runs only through the deployment-configured isolated sandbox runner, and never uses CPTR's agent model or host shell.",
+      inputSchema: codeBlockOperationSchema,
+      outputSchema: operationOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async (input) => result(await client.runCodeBlock(input)),
+  );
+
+  server.registerTool(
+    "cptr_run_ssh_operation",
+    {
+      title: "Request an approved SSH profile operation",
+      description:
+        "Use only when the user explicitly asks ChatGPT to run a named, administrator-configured SSH profile action. The operation is durable, approval-gated, strict-host-key checked, and CPTR does not reveal SSH credentials or free-form remote shell access to ChatGPT.",
+      inputSchema: sshOperationSchema,
+      outputSchema: operationOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
-    async (input) => result(await client.runCodingCommand(input)),
+    async (input) => result(await client.runSshOperation(input)),
   );
 
   server.registerTool(
-    "cptr_code_get_command",
+    "cptr_get_direct_operation",
     {
-      title: "Get direct-coding command status and output",
-      description:
-        "Use this to retrieve completion status and incremental output from a command previously started through direct coding.",
-      inputSchema: codingCommandStatusSchema,
+      title: "Get a durable direct operation",
+      description: "Use this to inspect the current lifecycle state and bounded result of a direct workspace operation.",
+      inputSchema: operationIdSchema,
+      outputSchema: operationOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ operation_id }) => result(await client.getDirectOperation(operation_id)),
+  );
+
+  server.registerTool(
+    "cptr_get_direct_operation_events",
+    {
+      title: "Get bounded direct-operation events",
+      description: "Use this to inspect a cursor-paginated lifecycle and output event stream for a durable direct operation.",
+      inputSchema: operationEventsSchema,
       outputSchema: {
-        command_id: z.string(),
-        status: z.string(),
-        exit_code: z.number().int().nullable(),
-        output: z.string(),
-        next_offset: z.number().int(),
+        operation_id: z.string(),
+        events: z.array(
+          z.object({
+            event_id: z.string(),
+            event_type: z.string(),
+            state: z.string().nullable(),
+            payload: z.record(z.string(), z.unknown()),
+            created_at: z.number(),
+          }),
+        ),
+        next_cursor: z.string().nullable(),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
-    async (input) => result(await client.getCodingCommand(input)),
+    async (input) => result(await client.getDirectOperationEvents(input)),
   );
 
   server.registerTool(
-    "cptr_code_cancel_command",
+    "cptr_cancel_direct_operation",
     {
-      title: "Cancel a direct-coding command",
+      title: "Cancel a durable direct operation",
       description:
-        "Use this only when the user explicitly asks ChatGPT to stop a running direct-coding command.",
-      inputSchema: codingCommandCancelSchema,
-      outputSchema: {
-        command_id: z.string(),
-        status: z.string(),
-        exit_code: z.number().int().nullable(),
-        output: z.string(),
-        next_offset: z.number().int(),
-      },
+        "Use only when the user explicitly asks ChatGPT to stop the identified operation. Reuse the idempotency key only to retry this exact cancellation request.",
+      inputSchema: cancelOperationSchema,
+      outputSchema: operationOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
-    async (input) => result(await client.cancelCodingCommand(input)),
+    async (input) => result(await client.cancelDirectOperation(input)),
   );
 
   server.registerTool(
-    "cptr_start_task",
+    "cptr_approve_direct_operation",
     {
-      title: "Start a CPTR task",
-      description: "Use this when the user explicitly wants CPTR to start an engineering task in a selected workspace.",
-      inputSchema: startTaskSchema,
-      outputSchema: { id: z.string(), status: z.string(), workspace_id: z.string() },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (input) => result(await client.startTask(input)),
-  );
-
-  server.registerTool(
-    "cptr_execute_task",
-    {
-      title: "Execute a CPTR task now",
+      title: "Approve or reject one pending direct operation",
       description:
-        "Use this only when the user explicitly asks ChatGPT to execute a contained task in a selected CPTR workspace. It starts an authorized CPTR task and waits up to 60 seconds for a result. If it remains active, return the task ID and use task-status tools rather than retrying. This tool does not grant additional CPTR permissions; CPTR authorization and approval policy remain authoritative.",
-      inputSchema: executeTaskSchema,
-      outputSchema: {
-        task_id: z.string(),
-        workspace_id: z.string(),
-        status: z.string(),
-        output: z.string(),
-        output_truncated: z.boolean(),
-        error: z.string().nullable().optional(),
-        completed: z.boolean(),
-        wait_seconds: z.number().int(),
-      },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-    },
-    async (input) => result(await client.executeTask(input)),
-  );
-
-  server.registerTool(
-    "cptr_monitor_autonomous",
-    {
-      title: "Monitor a CPTR engineering goal",
-      description: "Use this to create a persistent CPTR engineering monitor. The monitor continues server-side after the MCP call ends.",
-      inputSchema: monitorAutonomousSchema,
-      outputSchema: autonomousSummaryOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async (input) => result(await client.createAutonomous(input)),
-  );
-
-  server.registerTool(
-    "cptr_get_autonomous",
-    {
-      title: "Get a CPTR autonomous monitor",
-      description: "Use this to inspect the durable status of a CPTR autonomous monitor.",
-      inputSchema: monitorIdSchema,
-      outputSchema: autonomousSummaryOutputSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    },
-    async ({ monitor_id }) => result(await client.getAutonomous(monitor_id)),
-  );
-
-  server.registerTool(
-    "cptr_get_autonomous_events",
-    {
-      title: "Get CPTR autonomous events",
-      description: "Use this to inspect durable lifecycle events for a CPTR autonomous monitor.",
-      inputSchema: monitorIdSchema,
-      outputSchema: {
-        monitor_id: z.string().optional(),
-        events: z.array(z.record(z.string(), z.unknown())).optional(),
-      },
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    },
-    async ({ monitor_id }) => result(await client.getAutonomousEvents(monitor_id)),
-  );
-
-  server.registerTool(
-    "cptr_get_autonomous_evidence",
-    {
-      title: "Get CPTR autonomous evidence",
-      description: "Use this to inspect persisted worker and independent verification evidence for a CPTR autonomous monitor.",
-      inputSchema: monitorIdSchema,
-      outputSchema: {
-        monitor_id: z.string().optional(),
-        evidence: z.array(z.record(z.string(), z.unknown())).optional(),
-      },
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    },
-    async ({ monitor_id }) => result(await client.getAutonomousEvidence(monitor_id)),
-  );
-
-  server.registerTool(
-    "cptr_steer_autonomous",
-    {
-      title: "Steer a CPTR autonomous monitor",
-      description: "Use this to send a scoped follow-up message to a running CPTR autonomous monitor.",
-      inputSchema: steerAutonomousSchema,
-      outputSchema: {
-        task_id: z.string().optional(),
-        message_id: z.string().optional(),
-        status: z.string().optional(),
-      },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async ({ monitor_id, content }) => result(await client.steerAutonomous(monitor_id, content)),
-  );
-
-  server.registerTool(
-    "cptr_cancel_autonomous",
-    {
-      title: "Cancel a CPTR autonomous monitor",
-      description: "Use this when the user explicitly wants to stop a running CPTR autonomous monitor.",
-      inputSchema: monitorIdSchema,
-      outputSchema: autonomousSummaryOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
-    },
-    async ({ monitor_id }) => result(await client.cancelAutonomous(monitor_id)),
-  );
-
-  server.registerTool(
-    "cptr_approve_autonomous",
-    {
-      title: "Approve a CPTR autonomous action",
-      description: "Use this only when the user explicitly approves a pending CPTR action. Approval may release an external or destructive operation, so CPTR policy remains authoritative.",
-      inputSchema: approveAutonomousSchema,
-      outputSchema: autonomousSummaryOutputSchema,
+        "Use only when the user explicitly approves or rejects the specific pending operation. Approval is durable and bound to that operation; it cannot be inferred from a request flag.",
+      inputSchema: approveOperationSchema,
+      outputSchema: operationOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
-    async ({ monitor_id, approval_id, approved }) =>
-      result(await client.approveAutonomous(monitor_id, approval_id, approved)),
-  );
-
-  server.registerTool(
-    "cptr_get_task",
-    {
-      title: "Get CPTR task status",
-      description: "Use this when the user wants the current durable status of a CPTR task by task ID.",
-      inputSchema: taskIdSchema,
-      outputSchema: { id: z.string(), status: z.string() },
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    },
-    async ({ task_id }) => result(await client.getTask(task_id)),
-  );
-
-  server.registerTool(
-    "cptr_get_task_output",
-    {
-      title: "Get CPTR task output",
-      description: "Use this when the user wants durable output from a CPTR task by task ID.",
-      inputSchema: taskIdSchema,
-      outputSchema: { task_id: z.string(), status: z.string(), content: z.string() },
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    },
-    async ({ task_id }) => result(await client.getTaskOutput(task_id)),
-  );
-
-  server.registerTool(
-    "cptr_send_message",
-    {
-      title: "Send a message to CPTR",
-      description: "Use this when the user explicitly wants to steer an existing CPTR task with a follow-up message.",
-      inputSchema: messageSchema,
-      outputSchema: { task_id: z.string(), message_id: z.string(), status: z.string() },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    async ({ task_id, content }) => result(await client.sendMessage(task_id, content)),
-  );
-
-  server.registerTool(
-    "cptr_cancel_task",
-    {
-      title: "Cancel a CPTR task",
-      description: "Use this when the user explicitly wants to stop a running CPTR task by task ID.",
-      inputSchema: taskIdSchema,
-      outputSchema: { id: z.string(), status: z.string() },
-      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
-    },
-    async ({ task_id }) => result(await client.cancelTask(task_id)),
+    async (input) => result(await client.approveDirectOperation(input)),
   );
 
   server.registerTool(
     "cptr_get_diff",
     {
-      title: "Get a CPTR workspace diff",
-      description: "Use this when the user wants to inspect the current Git diff for a CPTR workspace.",
+      title: "Get a workspace Git diff",
+      description: "Use this to inspect the current Git diff in an authorized workspace after a direct operation.",
       inputSchema: workspaceIdSchema,
       outputSchema: { diff: z.unknown().optional() },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ workspace_id }) => result(await client.getDiff(workspace_id)),
   );
+
+  // Legacy compatibility fallback is opt-in. The default ChatGPT surface has
+  // no model-backed CPTR planning or agent-loop tools.
+  if (legacyFallbackEnabled) {
+    server.registerTool(
+    "cptr_legacy_start_task",
+    {
+      title: "Legacy fallback: start a CPTR agent task",
+      description: "Use only when the user explicitly requests the legacy CPTR agent workflow or durable direct operations cannot perform the requested capability.",
+      inputSchema: startTaskSchema,
+      outputSchema: { id: z.string(), status: z.string(), model_id: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (input) => result(await client.legacyStartTask(input)),
+  );
+  server.registerTool(
+    "cptr_legacy_execute_task",
+    {
+      title: "Legacy fallback: execute a CPTR agent task",
+      description: "Use only as an explicit fallback to the pre-existing CPTR agent workflow; this is not the default ChatGPT-controlled coding path.",
+      inputSchema: executeTaskSchema,
+      outputSchema: { task_id: z.string(), status: z.string(), output: z.string(), completed: z.boolean() },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (input) => result(await client.legacyExecuteTask(input)),
+  );
+  server.registerTool(
+    "cptr_legacy_monitor_autonomous",
+    {
+      title: "Legacy fallback: start CPTR autonomous monitoring",
+      description: "Use only when the user explicitly requests the legacy autonomous CPTR monitor instead of ChatGPT tool orchestration.",
+      inputSchema: monitorAutonomousSchema,
+      outputSchema: { monitor_id: z.string(), status: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async (input) => result(await client.legacyCreateAutonomous(input)),
+  );
+  server.registerTool(
+    "cptr_legacy_get_task",
+    {
+      title: "Legacy fallback: get CPTR task",
+      description: "Read a legacy CPTR task status when the explicit fallback workflow is in use.",
+      inputSchema: taskIdSchema,
+      outputSchema: { id: z.string(), status: z.string() },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ task_id }) => result(await client.legacyGetTask(task_id)),
+  );
+  server.registerTool(
+    "cptr_legacy_get_task_output",
+    {
+      title: "Legacy fallback: get CPTR task output",
+      description: "Read output from an already started legacy CPTR task.",
+      inputSchema: taskIdSchema,
+      outputSchema: { task_id: z.string(), status: z.string(), content: z.string() },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ task_id }) => result(await client.legacyGetTaskOutput(task_id)),
+  );
+  server.registerTool(
+    "cptr_legacy_send_task_message",
+    {
+      title: "Legacy fallback: steer CPTR task",
+      description: "Send a follow-up only when the user explicitly steers an existing legacy CPTR task.",
+      inputSchema: messageSchema,
+      outputSchema: { task_id: z.string(), message_id: z.string(), status: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ task_id, content }) => result(await client.legacySendMessage(task_id, content)),
+  );
+  server.registerTool(
+    "cptr_legacy_cancel_task",
+    {
+      title: "Legacy fallback: cancel CPTR task",
+      description: "Cancel an existing legacy CPTR task only when the user explicitly requests it.",
+      inputSchema: taskIdSchema,
+      outputSchema: { id: z.string(), status: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async ({ task_id }) => result(await client.legacyCancelTask(task_id)),
+  );
+  server.registerTool(
+    "cptr_legacy_get_autonomous",
+    {
+      title: "Legacy fallback: get autonomous monitor",
+      description: "Inspect a legacy autonomous monitor when the explicit fallback workflow is in use.",
+      inputSchema: monitorIdSchema,
+      outputSchema: { monitor_id: z.string(), status: z.string() },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ monitor_id }) => result(await client.legacyGetAutonomous(monitor_id)),
+  );
+  server.registerTool(
+    "cptr_legacy_get_autonomous_events",
+    {
+      title: "Legacy fallback: get monitor events",
+      description: "Inspect the events of a legacy autonomous monitor.",
+      inputSchema: monitorIdSchema,
+      outputSchema: { monitor_id: z.string(), events: z.array(z.unknown()) },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ monitor_id }) => result(await client.legacyGetAutonomousEvents(monitor_id)),
+  );
+  server.registerTool(
+    "cptr_legacy_get_autonomous_evidence",
+    {
+      title: "Legacy fallback: get monitor evidence",
+      description: "Inspect evidence for a legacy autonomous monitor.",
+      inputSchema: monitorIdSchema,
+      outputSchema: { monitor_id: z.string(), evidence: z.array(z.unknown()) },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ monitor_id }) => result(await client.legacyGetAutonomousEvidence(monitor_id)),
+  );
+  server.registerTool(
+    "cptr_legacy_steer_autonomous",
+    {
+      title: "Legacy fallback: steer autonomous monitor",
+      description: "Steer a legacy autonomous monitor only when the user explicitly requests it.",
+      inputSchema: steerAutonomousSchema,
+      outputSchema: { monitor_id: z.string(), status: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ monitor_id, content }) => result(await client.legacySteerAutonomous(monitor_id, content)),
+  );
+  server.registerTool(
+    "cptr_legacy_cancel_autonomous",
+    {
+      title: "Legacy fallback: cancel autonomous monitor",
+      description: "Cancel a legacy autonomous monitor only when the user explicitly requests it.",
+      inputSchema: monitorIdSchema,
+      outputSchema: { monitor_id: z.string(), status: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async ({ monitor_id }) => result(await client.legacyCancelAutonomous(monitor_id)),
+  );
+  server.registerTool(
+    "cptr_legacy_approve_autonomous",
+    {
+      title: "Legacy fallback: approve autonomous monitor step",
+      description: "Approve or reject a legacy autonomous monitor step only with explicit user authorization.",
+      inputSchema: approveAutonomousSchema,
+      outputSchema: { monitor_id: z.string(), status: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    },
+    async ({ monitor_id, approval_id, approved }) => result(await client.legacyApproveAutonomous(monitor_id, approval_id, approved)),
+  );
+
+  }
 
   return server;
 }

@@ -1,46 +1,55 @@
 # ChatGPT Computer Plugin
 
-Thin MCP adapter for `heidi-dang/computer`. CPTR remains responsible for execution, persistence, authentication, autonomous supervision, verification, retries, approvals, and restart recovery. This repository only exposes the ChatGPT-facing MCP tools and forwards scoped requests to CPTR's `/api/control/v1` API.
-
-The first pass intentionally has no widget. The MCP connection may end while CPTR continues the server-side autonomous monitor.
+This repository is a thin MCP transport adapter for CPTR. **Official ChatGPT plans and calls the tools.** CPTR supplies authenticated workspace authorization, durable operation lifecycle persistence, approval enforcement, bounded results, and execution policy. The default tool path uses CPTR `/api/control/v2` and does not invoke CPTR's agent loop, select a CPTR model, call `/v1/models`, call `/v1/chat/completions`, or require an OpenAI API key.
 
 ## Setup
 
 ```bash
 npm install
 cp .env.example .env
-```
-
-Set `CPTR_BASE_URL` to the CPTR origin and `CPTR_API_TOKEN` to a scoped CPTR bearer token. The token must be authorized by CPTR; the plugin is not trusted merely because ChatGPT called it.
-
-```bash
-npm run build
-npm test
 npm run typecheck
+npm test
+npm run build
 npm run dev
 ```
 
-The MCP endpoint is `http://${HOST}:${PORT}/mcp` and health is `/health`.
+Set `CPTR_BASE_URL` to the CPTR origin and `CPTR_API_TOKEN` to a dedicated scoped CPTR bearer token. The plugin is a transport adapter, not an authorization authority; CPTR verifies the token and workspace access for every call. The MCP endpoint is `http://${HOST}:${PORT}/mcp` and health is `/health`.
 
-## Tools
+| Required capability | CPTR scope |
+|---|---|
+| Bounded workspace inspection | `direct:inspect` |
+| Versioned file write and exact edit | `direct:mutate` |
+| Named action, code block, or SSH-action request | `direct:execute` |
+| Approval or rejection of a waiting direct operation | `direct:approve` |
 
-The adapter provides workspace-discovery tools plus eight **direct-coding tools**: `cptr_code_list_files`, `cptr_code_read_file`, `cptr_code_search_files`, `cptr_code_write_file`, `cptr_code_edit_file`, `cptr_code_run_command`, `cptr_code_get_command`, and `cptr_code_cancel_command`. These let the official ChatGPT app independently inspect, edit, test, and iterate inside an authorized CPTR workspace without creating a CPTR task, selecting a CPTR model, or invoking CPTR’s agent loop. The adapter also provides `cptr_start_task`, `cptr_execute_task`, autonomous-monitor tools, task-status tools, and `cptr_get_diff` for the separate CPTR-agent workflow. `cptr_execute_task` starts a scoped CPTR task and waits for at most 60 seconds before returning either its bounded result or the durable task ID for follow-up. `cptr_monitor_autonomous` only creates a durable CPTR supervisor; the dedicated autonomous tools inspect, steer, cancel, and approve it without keeping an endless polling loop in MCP.
+Default CPTR keys intentionally exclude all `direct:*` scopes. Provision the narrowest dedicated connector key necessary for the integration.
 
-Tool schemas are bounded with Zod and each tool declares read/write/destructive annotations. Annotations guide client behavior but do not replace CPTR authentication or authorization.
+## Default MCP tools
 
-## Official MCP shape
+The default MCP surface exposes workspace discovery, bounded file inspection, versioned file writes and edits, a named workspace action request, a durable code-block request, a durable SSH profile-action request, operation state/events, cancellation, direct-operation approval, and Git diff inspection.
 
-This server follows the current OpenAI Apps SDK guidance: the official TypeScript MCP SDK, Streamable HTTP at `/mcp`, explicit input/output schemas, and tool annotations. The closest official no-widget-compatible example is the Node MCP Apps server in `openai/openai-apps-sdk-examples`; this project does not register UI resources in the initial pass.
+Every side effect returns a durable `operation_id`. File mutations require the revision returned from a preceding read. Code blocks and SSH actions create `WAITING_APPROVAL`; a caller must separately approve the exact operation before it can queue. Operation events are bounded and use opaque `next_cursor` values, which callers must pass back unchanged.
 
-For local inspection, run `npx @modelcontextprotocol/inspector@latest`, select Streamable HTTP, and enter the configured `/mcp` URL. In ChatGPT Developer Mode, expose the endpoint through an HTTPS tunnel or deployment, add the `/mcp` URL as a connector, and refresh the connector after tool/schema changes.
+> **No default tool accepts `model_id`, an arbitrary local command, or a free-form remote SSH command.** The plugin does not advertise the retired v1 raw-command interface.
 
-## Security and limitations
+## Sandboxed code blocks and SSH profile actions
 
-- The CPTR token is read from the environment and is never returned in tool results or normalized errors.
-- The direct-coding tools are not CPTR agent delegation. They are scoped CPTR workspace primitives that the official ChatGPT app may chain autonomously: list, read, search, write, exact edit, run command, inspect command output, and cancel command. They require no CPTR `model_id` and no external OpenAI API key.
-- Direct coding is confined to the selected owned workspace. It rejects absolute/traversal paths, environment files, binary/oversized reads, ambiguous edits, and destructive commands. A potentially external command requires both explicit user approval through `allow_network=true` and CPTR’s separate `command:external` scope.
-- CPTR enforces workspace ownership and scopes such as `workspace:read`, `task:read`, `task:write`, `autonomous:run`, `git:read`, `coding:read`, `coding:write`, and `command:execute`. Existing tokens must be reissued with the three direct-coding scopes before these tools will work; `command:external` is intentionally not included in default newly issued keys.
-- This adapter does not grant `git:write` or `deploy:write`.
-- External/destructive autonomous assignments pause in CPTR with a durable approval record; the MCP `cptr_approve_autonomous` tool only forwards the scoped decision and cannot bypass CPTR policy.
-- No widget is included yet.
-- CPTR inherits its host-level security model; do not expose it to untrusted users without an appropriate authentication and network boundary.
+`cptr_run_code_block` accepts only Python, JavaScript, TypeScript, or Bash source and runs only after approval through CPTR's isolated code runner. CPTR never substitutes host shell execution if the configured runner is unavailable.
+
+`cptr_run_ssh_operation` accepts `ssh_profile` and `ssh_action`. The profile and its allowed remote action mapping are operator-managed in CPTR; the MCP caller cannot provide hostnames, key paths, known-hosts files, credentials, or raw remote shell text. SSH operations are always approval-gated.
+
+## Explicit legacy fallback
+
+The old CPTR task and autonomous workflows remain available as an explicit compatibility fallback, but are **not advertised by default**. Set the plugin environment variable below only when an operator intentionally wants these separately named tools:
+
+```bash
+CPTR_LEGACY_FALLBACK_ENABLED=true
+```
+
+This enables `cptr_legacy_*` tools, where `model_id` is retained only because those tools call the pre-existing CPTR agent or autonomous-monitor APIs. It does not restore legacy v1 direct write, edit, or raw host-shell command endpoints.
+
+## Security boundary
+
+The connector token is read from environment configuration and is never returned in tool results or normalized errors. CPTR confines direct operations to authorized workspaces, rejects absolute/traversal and sensitive paths, requires revision checks for mutation, enforces durable idempotency and workspace leases, bounds output, and records stable error codes. Tool annotations are advisory; CPTR authorization and policy are authoritative.
+
+A deployment should expose the connector only behind its appropriate authentication and network boundary. A live official ChatGPT connector session remains the final deployment acceptance test for platform-side tool permissions, credential scope provisioning, approval UX, and the host's sandbox availability.
