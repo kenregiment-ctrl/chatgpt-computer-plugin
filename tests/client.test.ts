@@ -1,34 +1,41 @@
-import assert from "node:assert/strict";
+import * as assert from "node:assert/strict";
 import test from "node:test";
 import { ComputerApiError, ComputerClient } from "../server/client/computer-client.js";
 
-test("forwards the scoped token and returns JSON", async () => {
+test("forwards the scoped token for workspace discovery without a model field", async () => {
   let seenRequest: RequestInit | undefined;
-  const fetchImpl = async (_input: RequestInfo | URL, init?: RequestInit) => {
-    seenRequest = init;
-    return new Response(JSON.stringify({ workspaces: [] }), { status: 200 });
-  };
-  const client = new ComputerClient({ baseUrl: "http://cptr.test/", token: "secret", fetchImpl });
+  const client = new ComputerClient({
+    baseUrl: "http://cptr.test/",
+    token: "secret",
+    fetchImpl: async (_input, init) => {
+      seenRequest = init;
+      return new Response(JSON.stringify({ workspaces: [] }), { status: 200 });
+    },
+  });
+
   assert.deepEqual(await client.listWorkspaces(), { workspaces: [] });
   assert.equal((seenRequest?.headers as Record<string, string>).Authorization, "Bearer secret");
+  assert.equal(String(seenRequest?.body ?? "").includes("model_id"), false);
 });
 
-test("normalizes CPTR errors without exposing credentials", async () => {
+test("normalizes bounded v2 API errors without exposing credentials", async () => {
   const client = new ComputerClient({
     baseUrl: "http://cptr.test",
     token: "secret-token",
-    fetchImpl: async () => new Response(JSON.stringify({ detail: "missing required scope: task:read" }), { status: 403 }),
+    fetchImpl: async () => new Response(JSON.stringify({ detail: { code: "REVISION_CONFLICT" } }), { status: 409 }),
   });
-  await assert.rejects(client.getTask("task-1"), (error: unknown) => {
-    assert.ok(error instanceof ComputerApiError);
-    assert.equal(error.status, 403);
-    assert.equal(error.message, "missing required scope: task:read");
-    assert.equal(error.message.includes("secret-token"), false);
+
+  await assert.rejects(client.getDirectOperation("operation-1"), (error: unknown) => {
+    const apiError = error as ComputerApiError;
+    assert.ok(apiError instanceof ComputerApiError);
+    assert.equal(apiError.status, 409);
+    assert.equal(apiError.code, "REVISION_CONFLICT");
+    assert.equal(apiError.message.includes("secret-token"), false);
     return true;
   });
 });
 
-test("converts request timeouts to a bounded public error", async () => {
+test("converts durable-operation request timeouts to a bounded public error", async () => {
   const client = new ComputerClient({
     baseUrl: "http://cptr.test",
     token: "secret-token",
@@ -37,223 +44,102 @@ test("converts request timeouts to a bounded public error", async () => {
       init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
     }),
   });
-  await assert.rejects(client.getTask("task-1"), (error: unknown) => {
-    assert.ok(error instanceof ComputerApiError);
-    assert.equal(error.status, 504);
-    assert.equal(error.code, "computer_api_timeout");
+
+  await assert.rejects(client.getDirectOperation("operation-1"), (error: unknown) => {
+    const apiError = error as ComputerApiError;
+    assert.ok(apiError instanceof ComputerApiError);
+    assert.equal(apiError.status, 504);
+    assert.equal(apiError.code, "computer_api_timeout");
     return true;
   });
 });
 
-test("routes dedicated autonomous operations to the scoped Control API", async () => {
+test("routes every direct coding primitive through the v2 durable operation API without model or shell fields", async () => {
   const seen: Array<{ url: string; init?: RequestInit }> = [];
-  const client = new ComputerClient({
-    baseUrl: "http://cptr.test",
-    token: "secret-token",
-    fetchImpl: async (input, init) => {
-      seen.push({ url: String(input), init });
-      return new Response(JSON.stringify({ monitor_id: "mon-1", status: "RUNNING" }), { status: 200 });
-    },
-  });
-
-  await client.createAutonomous({
+  const operation = {
+    operation_id: "operation-1",
     workspace_id: "ws-1",
-    goal: "Repair the fixture",
-    acceptance_criteria: ["tests pass"],
-    model_id: "model-1",
-  });
-  await client.getAutonomous("mon-1");
-  await client.getAutonomousEvents("mon-1");
-  await client.getAutonomousEvidence("mon-1");
-  await client.steerAutonomous("mon-1", "Continue");
-  await client.cancelAutonomous("mon-1");
-  await client.approveAutonomous("mon-1", "approval-1", true);
-
-  assert.deepEqual(seen.map((request) => request.url), [
-    "http://cptr.test/api/control/v1/autonomous",
-    "http://cptr.test/api/control/v1/autonomous/mon-1",
-    "http://cptr.test/api/control/v1/autonomous/mon-1/events",
-    "http://cptr.test/api/control/v1/autonomous/mon-1/evidence",
-    "http://cptr.test/api/control/v1/autonomous/mon-1/messages",
-    "http://cptr.test/api/control/v1/autonomous/mon-1/cancel",
-    "http://cptr.test/api/control/v1/autonomous/mon-1/approve",
-  ]);
-  assert.equal((seen[3].init?.headers as Record<string, string>).Authorization, "Bearer secret-token");
-});
-
-
-test("executes an already-complete CPTR task without exposing raw agent events", async () => {
-  const seen: Array<{ url: string; init?: RequestInit }> = [];
-  const client = new ComputerClient({
-    baseUrl: "http://cptr.test",
-    token: "secret-token",
-    fetchImpl: async (input, init) => {
-      seen.push({ url: String(input), init });
-      return new Response(
-        JSON.stringify({
-          id: "task-1",
-          workspace_id: "ws-1",
-          chat_id: "chat-1",
-          message_id: "message-1",
-          status: "COMPLETE",
-          prompt: "Inspect the fixture",
-          model_id: "model-1",
-          output: "Fixture inspected.",
-          raw_output: [{ type: "internal-event" }],
-          error: null,
-        }),
-        { status: 200 },
-      );
-    },
-  });
-
-  const result = await client.executeTask({
-    workspace_id: "ws-1",
-    prompt: "Inspect the fixture",
-    model_id: "model-1",
-    wait_seconds: 5,
-  });
-
-  assert.deepEqual(result, {
-    task_id: "task-1",
-    workspace_id: "ws-1",
-    status: "COMPLETE",
-    output: "Fixture inspected.",
-    output_truncated: false,
-    error: null,
-    completed: true,
-    wait_seconds: 5,
-  });
-  assert.deepEqual(seen.map((request) => request.url), ["http://cptr.test/api/control/v1/tasks"]);
-  assert.equal((seen[0].init?.headers as Record<string, string>).Authorization, "Bearer secret-token");
-});
-
-test("bounds direct-execution output before returning it to ChatGPT", async () => {
-  const client = new ComputerClient({
-    baseUrl: "http://cptr.test",
-    token: "secret-token",
-    fetchImpl: async () =>
-      new Response(
-        JSON.stringify({
-          id: "task-1",
-          workspace_id: "ws-1",
-          chat_id: "chat-1",
-          message_id: "message-1",
-          status: "COMPLETE",
-          prompt: "Inspect the fixture",
-          model_id: "model-1",
-          output: "x".repeat(20_001),
-          error: null,
-        }),
-        { status: 200 },
-      ),
-  });
-
-  const result = await client.executeTask({
-    workspace_id: "ws-1",
-    prompt: "Inspect the fixture",
-    model_id: "model-1",
-  });
-
-  assert.equal(result.output_truncated, true);
-  assert.equal(result.output.endsWith("[Output truncated by the MCP adapter.]"), true);
-  assert.equal(result.output.length, 20_040);
-});
-
-
-test("polls a running direct task until it reaches a terminal status", async () => {
-  let calls = 0;
-  const client = new ComputerClient({
-    baseUrl: "http://cptr.test",
-    token: "secret-token",
-    fetchImpl: async () => {
-      calls += 1;
-      const status = calls === 1 ? "RUNNING" : "COMPLETE";
-      return new Response(
-        JSON.stringify({
-          id: "task-1",
-          workspace_id: "ws-1",
-          chat_id: "chat-1",
-          message_id: "message-1",
-          status,
-          prompt: "Inspect the fixture",
-          model_id: "model-1",
-          output: status === "COMPLETE" ? "Fixture inspected." : "",
-          error: null,
-        }),
-        { status: 200 },
-      );
-    },
-  });
-
-  const result = await client.executeTask({
-    workspace_id: "ws-1",
-    prompt: "Inspect the fixture",
-    model_id: "model-1",
-    wait_seconds: 1,
-  });
-
-  assert.equal(calls, 2);
-  assert.equal(result.completed, true);
-  assert.equal(result.status, "COMPLETE");
-});
-
-
-test("routes direct ChatGPT coding operations only through scoped workspace endpoints", async () => {
-  const seen: Array<{ url: string; init?: RequestInit }> = [];
-  const response = {
-    workspace_id: "ws-1",
-    path: "src/app.ts",
-    command_id: "command-1",
-    status: "COMPLETE",
-    exit_code: 0,
-    output: "ok",
-    next_offset: 2,
-    content: "export {};\n",
-    start_line: 1,
-    end_line: 1,
-    total_lines: 1,
-    size: 11,
-    entries: "src/app.ts",
-    matches: "src/app.ts:1:export {}",
-    bytes_written: 11,
-    replaced_characters: 1,
-    inserted_characters: 1,
+    kind: "WRITE_FILE",
+    state: "SUCCEEDED",
+    approval_id: null,
+    result: {},
+    error_code: null,
+    created_at: 1,
+    updated_at: 2,
+    finished_at: 2,
   };
   const client = new ComputerClient({
     baseUrl: "http://cptr.test",
     token: "secret-token",
     fetchImpl: async (input, init) => {
       seen.push({ url: String(input), init });
-      return new Response(JSON.stringify(response), { status: 200 });
+      const url = String(input);
+      if (url.endsWith("/inspect/list")) {
+        return new Response(JSON.stringify({ workspace_id: "ws-1", path: ".", entries: [], next_cursor: null, truncated: false }), { status: 200 });
+      }
+      if (url.endsWith("/inspect/read")) {
+        return new Response(JSON.stringify({ workspace_id: "ws-1", path: "src/a.ts", content: "export {};", revision: "sha256:one", start_line: 1, end_line: 1, total_lines: 1, size: 10 }), { status: 200 });
+      }
+      if (url.includes("/events?")) {
+        return new Response(JSON.stringify({ operation_id: "operation-1", events: [], next_cursor: null }), { status: 200 });
+      }
+      return new Response(JSON.stringify(operation), { status: 200 });
     },
   });
 
-  await client.listCodingFiles({ workspace_id: "ws-1" });
-  await client.readCodingFile({ workspace_id: "ws-1", path: "src/app.ts" });
-  await client.searchCodingFiles({ workspace_id: "ws-1", query: "export" });
-  await client.writeCodingFile({ workspace_id: "ws-1", path: "src/app.ts", content: "export {};\n" });
-  await client.editCodingFile({
-    workspace_id: "ws-1",
-    path: "src/app.ts",
-    target: "{}",
-    replacement: "{ value: 1 }",
-  });
-  await client.runCodingCommand({ workspace_id: "ws-1", command: "npm test" });
-  await client.getCodingCommand({ workspace_id: "ws-1", command_id: "command-1" });
-  await client.cancelCodingCommand({ workspace_id: "ws-1", command_id: "command-1" });
+  await client.inspectFiles({ workspace_id: "ws-1" });
+  await client.inspectFile({ workspace_id: "ws-1", path: "src/a.ts" });
+  await client.createWriteOperation({ workspace_id: "ws-1", path: "src/a.ts", content: "export {};", expected_revision: "sha256:one", idempotency_key: "turn-1-write" });
+  await client.createEditOperation({ workspace_id: "ws-1", path: "src/a.ts", target: "{}", replacement: "{ value: 1 }", expected_revision: "sha256:one", idempotency_key: "turn-1-edit" });
+  await client.runWorkspaceAction({ workspace_id: "ws-1", action: "typecheck", idempotency_key: "turn-1-typecheck" });
+  await client.runCodeBlock({ workspace_id: "ws-1", language: "python", code: "print(1)", idempotency_key: "turn-1-code" });
+  await client.runSshOperation({ workspace_id: "ws-1", ssh_profile: "production", ssh_action: "status", idempotency_key: "turn-1-ssh" });
+  await client.getDirectOperation("operation-1");
+  await client.getDirectOperationEvents({ operation_id: "operation-1" });
+  await client.cancelDirectOperation({ operation_id: "operation-1", idempotency_key: "turn-1-cancel" });
+  await client.approveDirectOperation({ operation_id: "operation-1", approved: true, idempotency_key: "turn-1-approve" });
 
   assert.deepEqual(seen.map((request) => request.url), [
-    "http://cptr.test/api/control/v1/workspaces/ws-1/coding/list",
-    "http://cptr.test/api/control/v1/workspaces/ws-1/coding/read",
-    "http://cptr.test/api/control/v1/workspaces/ws-1/coding/search",
-    "http://cptr.test/api/control/v1/workspaces/ws-1/coding/write",
-    "http://cptr.test/api/control/v1/workspaces/ws-1/coding/edit",
-    "http://cptr.test/api/control/v1/workspaces/ws-1/coding/commands",
-    "http://cptr.test/api/control/v1/workspaces/ws-1/coding/commands/command-1?offset=0&wait_seconds=0",
-    "http://cptr.test/api/control/v1/workspaces/ws-1/coding/commands/command-1/cancel",
+    "http://cptr.test/api/control/v2/workspaces/ws-1/inspect/list",
+    "http://cptr.test/api/control/v2/workspaces/ws-1/inspect/read",
+    "http://cptr.test/api/control/v2/workspaces/ws-1/operations",
+    "http://cptr.test/api/control/v2/workspaces/ws-1/operations",
+    "http://cptr.test/api/control/v2/workspaces/ws-1/operations",
+    "http://cptr.test/api/control/v2/workspaces/ws-1/operations",
+    "http://cptr.test/api/control/v2/workspaces/ws-1/operations",
+    "http://cptr.test/api/control/v2/operations/operation-1",
+    "http://cptr.test/api/control/v2/operations/operation-1/events?limit=50",
+    "http://cptr.test/api/control/v2/operations/operation-1/cancel",
+    "http://cptr.test/api/control/v2/operations/operation-1/approval",
   ]);
-  const commandBody = JSON.parse(String(seen[5].init?.body));
-  assert.equal(commandBody.model_id, undefined);
-  assert.equal((seen[5].init?.headers as Record<string, string>).Authorization, "Bearer secret-token");
+
+  for (const request of seen) {
+    const body = String(request.init?.body ?? "");
+    assert.equal(body.includes("model_id"), false);
+    assert.equal(body.includes("remote_command"), false);
+    assert.equal((request.init?.headers as Record<string, string>).Authorization, "Bearer secret-token");
+  }
+
+  const writeBody = JSON.parse(String(seen[2].init?.body));
+  const codeBody = JSON.parse(String(seen[5].init?.body));
+  const sshBody = JSON.parse(String(seen[6].init?.body));
+  assert.deepEqual(codeBody, {
+    kind: "RUN_CODE_BLOCK",
+    language: "python",
+    code: "print(1)",
+    idempotency_key: "turn-1-code",
+  });
+  assert.deepEqual(sshBody, {
+    kind: "SSH_EXECUTE",
+    ssh_profile: "production",
+    ssh_action: "status",
+    idempotency_key: "turn-1-ssh",
+  });
+  assert.deepEqual(writeBody, {
+    kind: "WRITE_FILE",
+    path: "src/a.ts",
+    content: "export {};",
+    expected_revision: "sha256:one",
+    idempotency_key: "turn-1-write",
+  });
 });
